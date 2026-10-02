@@ -63,6 +63,7 @@ vi.mock('@/src/db', async () => {
 })
 
 import * as dbModule from '@/src/db'
+import { withSideLock } from '@/src/hardware/sideLock'
 import {
   startAutoOffWatcher,
   stopAutoOffWatcher,
@@ -483,6 +484,91 @@ describe('autoOffWatcher — global wall-clock cap', () => {
     startAutoOffWatcher()
     await vi.advanceTimersByTimeAsync(POLL_MS)
     expect(setPower).not.toHaveBeenCalled()
+  })
+})
+
+describe('autoOffWatcher — power-off queued behind the side lock', () => {
+  function holdSideLock(side: 'left' | 'right'): { release: () => void, held: Promise<void> } {
+    let release: () => void = () => {}
+    const held = withSideLock(side, () => new Promise<void>((resolve) => {
+      release = resolve
+    }))
+    return { release: () => release(), held }
+  }
+
+  it('queues one global-cap power-off however many polls pass while the lock is held', async () => {
+    setGlobalCap(8)
+    mockOccupancy.left = occ(true, true)
+    setSideOn('left', Date.now() - 9 * 3600_000)
+    const lock = holdSideLock('left')
+    await vi.advanceTimersByTimeAsync(0)
+
+    startAutoOffWatcher()
+    await vi.advanceTimersByTimeAsync(5 * POLL_MS)
+    expect(setPower).not.toHaveBeenCalled()
+
+    lock.release()
+    await lock.held
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(setPower).toHaveBeenCalledOnce()
+    expect(setPower).toHaveBeenCalledWith('left', false)
+  })
+
+  it('skips a timeout power-off when the occupant returns while it is queued', async () => {
+    setSideSettings('left', { autoOffMinutes: 1 })
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const lock = holdSideLock('left')
+    await vi.advanceTimersByTimeAsync(0)
+
+    startAutoOffWatcher()
+    await vi.advanceTimersByTimeAsync(60_000)
+    mockOccupancy.left = occ(true, true)
+
+    lock.release()
+    await lock.held
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(setPower).not.toHaveBeenCalled()
+    expect(broadcastMutationStatus).not.toHaveBeenCalled()
+    expect(log).toHaveBeenCalledWith('[auto-off] left: power-off skipped, no longer eligible')
+    expect(log).not.toHaveBeenCalledWith('[auto-off] Powered off left side (no presence detected)')
+    const state = (sqlite as any).prepare('SELECT is_powered FROM device_state WHERE side=?').get('left')
+    expect(state).toEqual({ is_powered: 1 })
+  })
+
+  it('skips a queued power-off when the lock holder already turned the side off', async () => {
+    setSideSettings('left', { autoOffMinutes: 1 })
+    const lock = holdSideLock('left')
+    await vi.advanceTimersByTimeAsync(0)
+
+    startAutoOffWatcher()
+    await vi.advanceTimersByTimeAsync(60_000)
+    ;(sqlite as any).prepare('UPDATE device_state SET is_powered=0 WHERE side=?').run('left')
+
+    lock.release()
+    await lock.held
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(setPower).not.toHaveBeenCalled()
+  })
+
+  it('does not re-check presence for a queued global-cap power-off', async () => {
+    setGlobalCap(8)
+    mockOccupancy.left = occ(false, false)
+    setSideOn('left', Date.now() - 9 * 3600_000)
+    const lock = holdSideLock('left')
+    await vi.advanceTimersByTimeAsync(0)
+
+    startAutoOffWatcher()
+    await vi.advanceTimersByTimeAsync(0)
+    mockOccupancy.left = occ(true, true)
+
+    lock.release()
+    await lock.held
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(setPower).toHaveBeenCalledWith('left', false)
   })
 })
 

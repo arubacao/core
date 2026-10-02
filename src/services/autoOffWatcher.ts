@@ -49,6 +49,16 @@ let pollHandle: ReturnType<typeof setInterval> | null = null
 /** Track in-flight powerOffSide() calls so shutdown can await them. */
 const pendingPowerOffs = new Set<Promise<void>>()
 
+/**
+ * Sides with a power-off queued or running. The off waits on the side lock and
+ * device_state stays powered until it runs, so without this every 30s poll
+ * would queue another power-off behind a long-held lock.
+ */
+const powerOffInFlight = new Set<Side>()
+
+/** 'timeout' = per-side presence countdown; 'cap' = global wall-clock cap. */
+type PowerOffReason = 'timeout' | 'cap'
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -181,11 +191,31 @@ function presenceState(side: Side): 'occupied' | 'empty' | 'unsensable' {
   }
 }
 
-/** Power off a side via the shared hardware client. */
-async function powerOffSide(side: Side): Promise<void> {
+/**
+ * Re-check, under the side lock, that the power-off is still warranted: the
+ * decision was made before queueing, and the lock holder may have changed the
+ * side's state. The presence check applies only to the per-side timeout; the
+ * global cap fires regardless of presence.
+ */
+function isStillEligible(side: Side, reason: PowerOffReason): boolean {
+  if (!isSidePowered(side) || hasActiveRunOnce(side)) return false
+  const cfg = getAutoOffConfig()[side]
+  if (cfg.alwaysOn) return false
+  if (reason === 'cap') return true
+  return cfg.enabled && presenceState(side) === 'empty'
+}
+
+/** Power off a side through the temperature controller. */
+async function powerOffSide(side: Side, reason: PowerOffReason): Promise<void> {
   try {
-    await getTemperatureController().powerOff(side)
-    console.log(`[auto-off] Powered off ${side} side (no presence detected)`)
+    let eligible = false
+    await getTemperatureController().powerOff(side, () => (eligible = isStillEligible(side, reason)))
+    if (eligible) {
+      console.log(`[auto-off] Powered off ${side} side (no presence detected)`)
+    }
+    else {
+      console.log(`[auto-off] ${side}: power-off skipped, no longer eligible`)
+    }
   }
   catch (error) {
     console.error(
@@ -198,9 +228,11 @@ async function powerOffSide(side: Side): Promise<void> {
 /**
  * Fire powerOffSide and track the promise so shutdown can await it.
  */
-function firePowerOff(side: Side): void {
+function firePowerOff(side: Side, reason: PowerOffReason): void {
   clearEmptySince(side)
-  const p = powerOffSide(side).finally(() => {
+  powerOffInFlight.add(side)
+  const p = powerOffSide(side, reason).finally(() => {
+    powerOffInFlight.delete(side)
     pendingPowerOffs.delete(p)
   })
   pendingPowerOffs.add(p)
@@ -216,6 +248,9 @@ function evaluateSide(
   globalMaxOnHours: number | null,
 ): void {
   const cfg = config[side]
+
+  // A power-off is already queued; it re-checks eligibility once it runs.
+  if (powerOffInFlight.has(side)) return
 
   // Side already off — nothing to evaluate for either cap
   if (!isSidePowered(side)) {
@@ -248,7 +283,7 @@ function evaluateSide(
         console.log(
           `[auto-off] ${side}: global max-on cap exceeded (${globalMaxOnHours}h), powering off`,
         )
-        firePowerOff(side)
+        firePowerOff(side, 'cap')
         return
       }
     }
@@ -294,7 +329,7 @@ function evaluateSide(
     console.log(
       `[auto-off] ${side}: empty for ${Math.round(emptyMs / 1000)}s (past ${cfg.minutes}min timeout), powering off`,
     )
-    firePowerOff(side)
+    firePowerOff(side, 'timeout')
   }
 }
 

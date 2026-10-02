@@ -553,6 +553,75 @@ describe('autoOffWatcher — power-off queued behind the side lock', () => {
     expect(setPower).not.toHaveBeenCalled()
   })
 
+  it('skips a queued global-cap power-off when the cap is disabled while it waits', async () => {
+    setGlobalCap(8)
+    mockOccupancy.left = occ(true, true)
+    setSideOn('left', Date.now() - 9 * 3600_000)
+    const lock = holdSideLock('left')
+    await vi.advanceTimersByTimeAsync(0)
+
+    startAutoOffWatcher()
+    await vi.advanceTimersByTimeAsync(0)
+    setGlobalCap(null)
+
+    lock.release()
+    await lock.held
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(setPower).not.toHaveBeenCalled()
+  })
+
+  it('skips a queued timeout power-off when the timeout is raised while it waits', async () => {
+    setSideSettings('left', { autoOffMinutes: 1 })
+    const lock = holdSideLock('left')
+    await vi.advanceTimersByTimeAsync(0)
+
+    startAutoOffWatcher()
+    await vi.advanceTimersByTimeAsync(60_000)
+    setSideSettings('left', { autoOffMinutes: 30 })
+
+    lock.release()
+    await lock.held
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(setPower).not.toHaveBeenCalled()
+  })
+
+  it('skips a queued timeout power-off when its countdown is cancelled while it waits', async () => {
+    setSideSettings('left', { autoOffMinutes: 1 })
+    const lock = holdSideLock('left')
+    await vi.advanceTimersByTimeAsync(0)
+
+    startAutoOffWatcher()
+    await vi.advanceTimersByTimeAsync(60_000)
+    cancelAutoOffTimer('left')
+
+    lock.release()
+    await lock.held
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(setPower).not.toHaveBeenCalled()
+  })
+
+  it('restarts the countdown after a skipped power-off instead of retrying on the next poll', async () => {
+    setSideSettings('left', { autoOffMinutes: 1 })
+    const lock = holdSideLock('left')
+    await vi.advanceTimersByTimeAsync(0)
+
+    startAutoOffWatcher()
+    await vi.advanceTimersByTimeAsync(60_000)
+    mockOccupancy.left = occ(true, true)
+    lock.release()
+    await lock.held
+    await vi.advanceTimersByTimeAsync(0)
+    mockOccupancy.left = occ(false, true)
+
+    await vi.advanceTimersByTimeAsync(POLL_MS)
+    expect(setPower).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(setPower).toHaveBeenCalledWith('left', false)
+  })
+
   it('does not re-check presence for a queued global-cap power-off', async () => {
     setGlobalCap(8)
     mockOccupancy.left = occ(false, false)
